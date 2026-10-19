@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
+import { withMetrics } from "@/lib/metrics-middleware";
 
 import { successResponse, handleApiError, badRequestError, unauthorizedError } from "@/lib/api-response";
 import { getAuthContext } from "@/lib/auth-session";
+import { verifyCsrf } from "@/lib/csrf";
 import { simulateContractCall, DEFAULT_CONTRACT_ID, CHAIN_READ_SOURCE } from "@/lib/contracts";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { withRequestLogging } from "@/lib/request-logging";
@@ -10,7 +12,7 @@ import { withRequestLogging } from "@/lib/request-logging";
  * GET /api/escrows — list escrows or fetch single by ?id=N
  * Reads from OphirPayContract on-chain.
  */
-export const GET = withRequestLogging(async function GET(request: Request) {
+export const GET = withMetrics("GET /api/escrows", withRequestLogging(async function GET(request: Request) {
   try {
     const auth = await getAuthContext(request);
     if (!auth) {
@@ -41,13 +43,16 @@ export const GET = withRequestLogging(async function GET(request: Request) {
   } catch (err) {
     return handleApiError(err, "GET /api/escrows");
   }
-});
+}));
 
 /**
  * POST /api/escrows — create escrow (requires wallet signing, delegates to client)
  */
-export const POST = withRequestLogging(async function POST(request: Request) {
+export const POST = withMetrics("POST /api/escrows", withRequestLogging(async function POST(request: Request) {
   try {
+    const csrfError = verifyCsrf(request);
+    if (csrfError) return csrfError;
+
     const auth = await getAuthContext(request);
     if (!auth) {
       return unauthorizedError("Authentication required. Connect your wallet or provide an API key.");
@@ -67,4 +72,4 @@ export const POST = withRequestLogging(async function POST(request: Request) {
   } catch (err) {
     return handleApiError(err, "POST /api/escrows");
   }
-});
+}));

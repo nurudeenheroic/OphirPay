@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+import { withMetrics } from "@/lib/metrics-middleware";
 
 import { successResponse, unauthorizedError, handleApiError } from "@/lib/api-response";
 import { getAuthContext } from "@/lib/auth-session";
@@ -7,6 +8,7 @@ import { voteOnProposal } from "@/lib/contract-advanced";
 import { validateBody, voteOnProposalSchema } from "@/lib/validation-schemas";
 import { cacheDelete } from "@/lib/api-cache";
 import { withRequestLogging } from "@/lib/request-logging";
+import prisma from "@/lib/prisma";
 
 /** Invalidate the cached proposal reads so a refetch shows the fresh vote. */
 function invalidateProposalCache(proposalId: number) {
@@ -18,7 +20,7 @@ function invalidateProposalCache(proposalId: number) {
  * POST /api/governance/vote — cast a vote on a proposal
  * Calls OphirPayContract.vote_on_proposal() on-chain.
  */
-export const POST = withRequestLogging(async function POST(request: Request) {
+export const POST = withMetrics("POST /api/governance/vote", withRequestLogging(async function POST(request: Request) {
   try {
     const auth = await getAuthContext(request);
     if (!auth) {
@@ -43,9 +45,22 @@ export const POST = withRequestLogging(async function POST(request: Request) {
       );
     }
 
+    // The contract emits a vote event but does not expose an enumerable vote
+    // history read. Persist this app-submitted vote in the existing audit log
+    // so proposal detail pages can show voter/support history. The on-chain
+    // transaction remains authoritative if this best-effort mirror fails.
+    await prisma.auditLog.create({
+      data: {
+        action: "governance:vote",
+        actor: auth.userId,
+        target: String(proposalId),
+        details: { voter, support, txHash: result.txHash ?? null },
+      },
+    }).catch(() => undefined);
+
     invalidateProposalCache(proposalId);
     return successResponse({ voted: true, proposalId, txHash: result.txHash });
   } catch (err) {
     return handleApiError(err, "POST /api/governance/vote");
   }
-});
+}));

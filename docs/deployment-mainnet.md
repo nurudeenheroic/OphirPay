@@ -2,6 +2,11 @@
 
 This guide walks through deploying OphirPay to Stellar Mainnet with PostgreSQL, Soroban contracts, Kubernetes, and monitoring.
 
+> 🚀 **Looking for the executable checklist?** Use the
+> [**Mainnet Deployment Runbook**](./MAINNET_RUNBOOK.md) — it consolidates this
+> guide into a step-by-step runbook with a pre-flight checklist (funding, WASM
+> hashes, contract IDs), rollback procedures, and post-deploy verification.
+
 ## Pre-Flight Checklist
 
 - [ ] Stellar Mainnet Horizon URL and Soroban RPC URL obtained
@@ -272,8 +277,8 @@ curl https://ophirpay.com/api/health
 ### 5.1 Verify Prometheus scraping
 
 ```bash
-# Metrics should be available at:
-curl https://ophirpay.com/api/metrics
+# Metrics require the scrape token (see docs/metrics-endpoints.md):
+curl -H "Authorization: Bearer $METRICS_TOKEN" https://ophirpay.com/api/metrics
 ```
 
 ### 5.2 Import Grafana dashboard

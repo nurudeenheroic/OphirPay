@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
+import { withMetrics } from "@/lib/metrics-middleware";
 
 import { successResponse, handleApiError, notFoundError, unauthorizedError } from "@/lib/api-response";
 import { getAuthContext } from "@/lib/auth-session";
 import { simulateContractCall, DEFAULT_CONTRACT_ID, CHAIN_READ_SOURCE } from "@/lib/contracts";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { withRequestLogging } from "@/lib/request-logging";
+import { validateIdParam } from "@/lib/validate-params";
 
 /**
  * GET /api/escrows/[id] — single escrow lookup
  * Reads from OphirPayContract on-chain.
  */
-export const GET = withRequestLogging(async function GET(
+export const GET = withMetrics("GET /api/escrows/[id]", withRequestLogging(async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -22,12 +24,9 @@ export const GET = withRequestLogging(async function GET(
       );
     }
 
-    const { id } = await params;
-    const escrowId = parseInt(id, 10);
-
-    if (isNaN(escrowId)) {
-      return notFoundError("Invalid escrow ID");
-    }
+    const parsed = await validateIdParam(params, "numeric");
+    if (!parsed.success) return parsed.response;
+    const escrowId = Number(parsed.id);
 
     const result = await simulateContractCall(
       DEFAULT_CONTRACT_ID,
@@ -37,11 +36,11 @@ export const GET = withRequestLogging(async function GET(
     );
 
     if (result.status === "SIMULATION_FAILED" || !result.returnValue) {
-      return notFoundError(`Escrow ${id} not found`);
+      return notFoundError(`Escrow ${parsed.id} not found`);
     }
 
     return successResponse(result.returnValue);
   } catch (err) {
     return handleApiError(err, "GET /api/escrows/[id]");
   }
-});
+}));

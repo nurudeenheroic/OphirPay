@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
+import { withMetrics } from "@/lib/metrics-middleware";
 
-import crypto from "crypto";
 import prisma from "@/lib/prisma";
 import {
   successResponse,
@@ -10,67 +10,246 @@ import {
 } from "@/lib/api-response";
 import { logger } from "@/lib/logger";
 import { getAuthContext } from "@/lib/auth-session";
-import { deriveKeyPrefix } from "@/lib/api-auth";
+import {
+  deriveKeyPrefix,
+  generateApiKey,
+  hashApiKeyV1,
+  API_SCOPES,
+} from "@/lib/api-auth";
 import { withRequestLogging } from "@/lib/request-logging";
+import { verifyCsrf } from "@/lib/csrf";
+import {
+  activeApiKeyWhere,
+  apiKeyLimitError,
+  apiKeyQuotaError,
+  describeKeyInitiator,
+  isRetryableTransactionError,
+} from "@/lib/api-key-limits";
+import {
+  consumeApiKeyMutationQuota,
+  MAX_ACTIVE_API_KEYS,
+} from "@/lib/rate-limit";
+
+/** Validate an array of scopes against the known set. */
+function parseScopes(input: unknown): {
+  ok: boolean;
+  scopes: string[];
+  error?: string;
+} {
+  if (input === undefined || input === null) return { ok: true, scopes: [] };
+  if (!Array.isArray(input)) {
+    return { ok: false, scopes: [], error: "scopes must be an array" };
+  }
+  const known = new Set<string>(API_SCOPES);
+  for (const s of input) {
+    if (typeof s !== "string" || !known.has(s)) {
+      return {
+        ok: false,
+        scopes: [],
+        error: `Unknown scope: ${String(s)}. Allowed: ${API_SCOPES.join(", ")}`,
+      };
+    }
+  }
+  // Deduplicate while preserving order
+  return { ok: true, scopes: Array.from(new Set(input as string[])) };
+}
 
 /**
  * GET /api/keys — list the authenticated user's API keys (no hashes).
  */
-export const GET = withRequestLogging(async function GET(request: Request) {
+export const GET = withMetrics("GET /api/keys", withRequestLogging(async function GET(request: Request) {
   try {
     const auth = await getAuthContext(request);
     if (!auth) return unauthorizedError("Authentication required.");
 
     const keys = await prisma.apiKey.findMany({
-      where: { userId: auth.userId },
+      where: { userId: auth.userId, revokedAt: null },
       orderBy: { createdAt: "desc" },
-      select: { id: true, name: true, prefix: true, lastUsed: true, createdAt: true, expiresAt: true },
+      select: {
+        id: true,
+        name: true,
+        prefix: true,
+        scopes: true,
+        lastUsed: true,
+        createdAt: true,
+        expiresAt: true,
+        revokedAt: true,
+        rotatedAt: true,
+        rotatedToId: true,
+      },
     });
     return successResponse(keys);
   } catch (err) {
     return handleApiError(err, "GET /api/keys");
   }
-});
+}));
 
 /**
  * POST /api/keys — generate a new API key for the authenticated user.
  * The raw key is returned only once; only the hash is stored.
+ * Accepts an optional `scopes` array to restrict what the key can do.
  */
-export const POST = withRequestLogging(async function POST(request: Request) {
+export const POST = withMetrics("POST /api/keys", withRequestLogging(async function POST(request: Request) {
   try {
+    const csrfError = verifyCsrf(request);
+    if (csrfError) return csrfError;
+
     const auth = await getAuthContext(request);
     if (!auth) return unauthorizedError("Authentication required.");
 
-    const { name } = await request.json() as { name?: string };
-    if (!name || typeof name !== "string" || name.trim().length === 0) {
+    const body = (await request.json().catch(() => ({}))) as {
+      name?: string;
+      scopes?: unknown;
+    };
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) {
       return badRequestError("Name is required");
     }
 
-    const rawKey = `oph_${crypto.randomBytes(24).toString("hex")}`;
-    const keyHash = crypto.createHash("sha256").update(rawKey).digest("hex");
-    const prefix = deriveKeyPrefix(rawKey);
+    const parsed = parseScopes(body.scopes);
+    if (!parsed.ok) {
+      return badRequestError(parsed.error ?? "Invalid scopes");
+    }
 
-    const apiKey = await prisma.apiKey.create({
-      data: { name: name.trim(), keyHash, prefix, userId: auth.userId },
+    // Charge the hourly create/rotate quota before touching the database. A
+    // valid-looking request from a compromised session must not be able to
+    // mint credentials faster than a human can react.
+    const quota = await consumeApiKeyMutationQuota(auth.userId);
+    if (!quota.allowed) return apiKeyQuotaError(quota);
+
+    // `generateApiKey` mints 32 CSPRNG bytes (issue #701) and fails closed if
+    // the result ever drifts from the documented `oph_` + 64-hex format.
+    const rawKey = generateApiKey();
+    const keyHash = hashApiKeyV1(rawKey);
+    const prefix = deriveKeyPrefix(rawKey);
+    const initiatedBy = describeKeyInitiator(auth);
+
+    // The cap is a count followed by an insert, so both must run in one
+    // Serializable transaction. Under the default isolation level two
+    // concurrent creates can each observe four keys and both insert, leaving
+    // the account with six. A serialization failure (P2034) means the other
+    // transaction won; retrying re-reads the count and rejects the loser.
+    let apiKey: { id: string; name: string } | null = null;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        apiKey = await prisma.$transaction(
+          async (tx) => {
+            const activeKeys = await tx.apiKey.count({
+              where: activeApiKeyWhere(auth.userId),
+            });
+            if (activeKeys >= MAX_ACTIVE_API_KEYS) return null;
+
+            const created = await tx.apiKey.create({
+              data: {
+                name,
+                keyHash,
+                prefix,
+                userId: auth.userId,
+                scopes: parsed.scopes,
+              },
+            });
+
+            // Creation is a security-relevant event: a new credential can
+            // move money. Record it alongside the key so the audit trail can
+            // never be missing an entry for a key that exists.
+            await tx.auditLog.create({
+              data: {
+                action: "api_key:create",
+                actor: auth.userId,
+                target: created.id,
+                details: {
+                  name: created.name,
+                  prefix,
+                  scopes: parsed.scopes,
+                  initiatedBy,
+                },
+              },
+            });
+
+            return { id: created.id, name: created.name };
+          },
+          { isolationLevel: "Serializable" }
+        );
+        break;
+      } catch (err) {
+        if (isRetryableTransactionError(err) && attempt < 2) continue;
+        throw err;
+      }
+    }
+
+    if (!apiKey) return apiKeyLimitError();
+
+    logger.info("API key generated", {
+      id: apiKey.id,
+      name,
+      scopes: parsed.scopes,
+      initiatedBy,
     });
 
-    logger.info("API key generated", { id: apiKey.id, name });
-
     return successResponse(
-      { id: apiKey.id, name: apiKey.name, prefix, key: rawKey },
+      {
+        id: apiKey.id,
+        name: apiKey.name,
+        prefix,
+        scopes: parsed.scopes,
+        key: rawKey,
+      },
       undefined,
       201
     );
   } catch (err) {
     return handleApiError(err, "POST /api/keys");
   }
-});
+}));
+
+/**
+ * PATCH /api/keys — update the scopes of one of the authenticated user's keys.
+ * Body: { id: string, scopes: string[] }
+ */
+export const PATCH = withMetrics("PATCH /api/keys", __ophir_PATCH);
+
+async function __ophir_PATCH(request: Request) {
+  try {
+    const csrfError = verifyCsrf(request);
+    if (csrfError) return csrfError;
+
+    const auth = await getAuthContext(request);
+    if (!auth) return unauthorizedError("Authentication required.");
+
+    const body = (await request.json().catch(() => ({}))) as {
+      id?: string;
+      scopes?: unknown;
+    };
+    if (!body.id || typeof body.id !== "string") {
+      return badRequestError("Key ID is required");
+    }
+
+    const parsed = parseScopes(body.scopes);
+    if (!parsed.ok) {
+      return badRequestError(parsed.error ?? "Invalid scopes");
+    }
+
+    // Scoped update — a user can only modify their own key
+    const result = await prisma.apiKey.updateMany({
+      where: { id: body.id, userId: auth.userId, revokedAt: null },
+      data: { scopes: parsed.scopes },
+    });
+    if (result.count === 0) return badRequestError("Key not found");
+
+    return successResponse({ id: body.id, scopes: parsed.scopes });
+  } catch (err) {
+    return handleApiError(err, "PATCH /api/keys");
+  }
+}
 
 /**
  * DELETE /api/keys?id=... — revoke one of the authenticated user's keys.
  */
-export const DELETE = withRequestLogging(async function DELETE(request: Request) {
+export const DELETE = withMetrics("DELETE /api/keys", withRequestLogging(async function DELETE(request: Request) {
   try {
+    const csrfError = verifyCsrf(request);
+    if (csrfError) return csrfError;
+
     const auth = await getAuthContext(request);
     if (!auth) return unauthorizedError("Authentication required.");
 
@@ -79,8 +258,9 @@ export const DELETE = withRequestLogging(async function DELETE(request: Request)
     if (!id) return badRequestError("Key ID is required");
 
     // Scoped delete — a user can only revoke their own key
-    const result = await prisma.apiKey.deleteMany({
-      where: { id, userId: auth.userId },
+    const result = await prisma.apiKey.updateMany({
+      where: { id, userId: auth.userId, revokedAt: null },
+      data: { revokedAt: new Date() },
     });
     if (result.count === 0) return badRequestError("Key not found");
 
@@ -88,4 +268,4 @@ export const DELETE = withRequestLogging(async function DELETE(request: Request)
   } catch (err) {
     return handleApiError(err, "DELETE /api/keys");
   }
-});
+}));

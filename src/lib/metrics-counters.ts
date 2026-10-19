@@ -18,7 +18,70 @@ const counters = {
   webhooks_failed_total: 0,
   db_query_duration_seconds_sum: 0,
   db_query_duration_seconds_count: 0,
+  /** Gauge: currently open SSE event-stream connections (inc on connect, dec on disconnect). */
+  sse_open_connections: 0,
+  /**
+   * Counter: SSE events shed because a slow/stalled consumer exhausted its
+   * bounded outbound buffer (issue #744). A rising value with a flat
+   * `sse_open_connections` means clients are being out-paced by the stream.
+   */
+  sse_dropped_events_total: 0,
+  /** Counter: cumulative RPC failover transitions (issue #820). */
+  rpc_failover_total: 0,
+  /** Counter: cumulative RPC recoveries to the primary endpoint (issue #820). */
+  rpc_failover_recoveries_total: 0,
+  /**
+   * Counter: CSP violation reports received at POST /api/csp-report (issue #698).
+   * Incremented once per accepted, parsed, and logged report.  Oversized or
+   * malformed requests are rejected before reaching this counter.
+   */
+  csp_violation_reports_total: 0,
 };
+
+export type CspReportDropReason = "rate_limited" | "deduplicated" | "oversized";
+
+const cspReportsDropped = new Map<CspReportDropReason, number>([
+  ["rate_limited", 0],
+  ["deduplicated", 0],
+  ["oversized", 0],
+]);
+
+/** Increment the counter for dropped CSP violation reports (#1392). */
+export function incCspReportsDropped(reason: CspReportDropReason, delta = 1): void {
+  cspReportsDropped.set(reason, (cspReportsDropped.get(reason) ?? 0) + delta);
+}
+
+/** Get a snapshot of dropped CSP report counts by reason. */
+export function getCspReportsDroppedSnapshot(): Record<CspReportDropReason, number> {
+  return {
+    rate_limited: cspReportsDropped.get("rate_limited") ?? 0,
+    deduplicated: cspReportsDropped.get("deduplicated") ?? 0,
+    oversized: cspReportsDropped.get("oversized") ?? 0,
+  };
+}
+
+/** Last failover snapshot read by a scrape, for diffing gauge/counter gauges. */
+let lastRpcFailover: {
+  failoverCount: number;
+  recoveryCount: number;
+  activeEndpoint: string | null;
+  primaryEndpoint: string | null;
+  usingFallback: boolean;
+  currentFallbackDurationMs: number;
+  longestFallbackDurationMs: number;
+} | null = null;
+
+/** Store the latest RPC failover state so the metrics exposition stays consistent. */
+export function recordRpcFailoverState(state: NonNullable<typeof lastRpcFailover>): void {
+  lastRpcFailover = state;
+  counters.rpc_failover_total = state.failoverCount;
+  counters.rpc_failover_recoveries_total = state.recoveryCount;
+}
+
+/** Read the last recorded RPC failover state (null before the first record). */
+export function getRpcFailoverSnapshot(): typeof lastRpcFailover {
+  return lastRpcFailover;
+}
 
 export type MetricName = keyof typeof counters;
 export type DeliveryType = "webhook" | "batch";
@@ -104,6 +167,7 @@ export function observeDbQuery(durationSeconds: number): void {
 export function getMetricsSnapshot(): typeof counters & {
   delivery_attempts: DeliveryAttemptMetric[];
   delivery_final_outcomes: DeliveryFinalOutcomeMetric[];
+  csp_reports_dropped: Record<CspReportDropReason, number>;
 } {
   return {
     ...counters,
@@ -118,6 +182,7 @@ export function getMetricsSnapshot(): typeof counters & {
         a.attempt_number - b.attempt_number ||
         a.final_outcome.localeCompare(b.final_outcome)
     ),
+    csp_reports_dropped: getCspReportsDroppedSnapshot(),
   };
 }
 
@@ -127,4 +192,106 @@ export function resetMetricsForTest(): void {
   }
   deliveryAttempts.clear();
   deliveryFinalOutcomes.clear();
+  lastRpcFailover = null;
+  for (const reason of ["rate_limited", "deduplicated", "oversized"] as CspReportDropReason[]) {
+    cspReportsDropped.set(reason, 0);
+  }
+}
+
+// ── Per-endpoint latency histograms and error counts ──────────
+//
+// Latency is recorded per (method + endpoint + status class) so operators
+// can see, for every route, how slow it is and how often it fails. The
+// "endpoint" key keeps dynamic segments literal (e.g. `/api/payments/[id]`)
+// so each route produces a stable, bounded set of time series.
+
+export type StatusClass = "2xx" | "3xx" | "4xx" | "5xx";
+
+/** Histogram bucket upper bounds (seconds). A trailing +Inf bound is implied. */
+export const LATENCY_BUCKET_BOUNDS = [
+  0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+];
+
+export interface EndpointObservation {
+  requests: number;
+  errors: number;
+  latencySum: number;
+  latencyCount: number;
+  /** Cumulative counts per bucket; length = LATENCY_BUCKET_BOUNDS.length + 1 (+Inf). */
+  buckets: number[];
+}
+
+const endpointMetrics = new Map<string, EndpointObservation>();
+
+function statusClassOf(status: number): StatusClass {
+  if (status >= 500) return "5xx";
+  if (status >= 400) return "4xx";
+  if (status >= 300) return "3xx";
+  return "2xx";
+}
+
+/**
+ * Record a single request's latency keyed by endpoint + status class.
+ * `status` may be 0 when the handler didn't return a Response we can read;
+ * it is treated as a successful (2xx) request in that case.
+ */
+export function recordEndpointLatency(
+  method: string,
+  endpoint: string,
+  status: number,
+  durationSeconds: number
+): void {
+  const statusClass = statusClassOf(status || 200);
+  const key = `${method} ${endpoint}|${statusClass}`;
+
+  let obs = endpointMetrics.get(key);
+  if (!obs) {
+    obs = {
+      requests: 0,
+      errors: 0,
+      latencySum: 0,
+      latencyCount: 0,
+      buckets: new Array(LATENCY_BUCKET_BOUNDS.length + 1).fill(0),
+    };
+    endpointMetrics.set(key, obs);
+  }
+
+  obs.requests += 1;
+  obs.latencySum += durationSeconds;
+  obs.latencyCount += 1;
+  if (statusClass === "4xx" || statusClass === "5xx") obs.errors += 1;
+
+  for (let i = 0; i < LATENCY_BUCKET_BOUNDS.length; i++) {
+    if (durationSeconds <= LATENCY_BUCKET_BOUNDS[i]) obs.buckets[i] += 1;
+  }
+  // +Inf bucket always counts the observation.
+  obs.buckets[LATENCY_BUCKET_BOUNDS.length] += 1;
+}
+
+export interface EndpointMetricEntry {
+  method: string;
+  endpoint: string;
+  statusClass: StatusClass;
+  observation: EndpointObservation;
+}
+
+/** Read all collected per-endpoint observations (for scraping/serialization). */
+export function getEndpointMetrics(): EndpointMetricEntry[] {
+  const entries: EndpointMetricEntry[] = [];
+  for (const [key, observation] of endpointMetrics.entries()) {
+    const [methodAndEndpoint, statusClass] = key.split("|");
+    const [method, ...rest] = methodAndEndpoint.split(" ");
+    entries.push({
+      method,
+      endpoint: rest.join(" "),
+      statusClass: statusClass as StatusClass,
+      observation,
+    });
+  }
+  return entries;
+}
+
+/** Reset per-endpoint metrics. Intended for tests. */
+export function resetEndpointMetrics(): void {
+  endpointMetrics.clear();
 }

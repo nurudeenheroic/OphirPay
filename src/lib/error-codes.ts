@@ -73,7 +73,12 @@ export const ERROR_CODES = {
   // ═══════════════════════════════════════════════════════════════
   FORBIDDEN: "FORBIDDEN",
   INSUFFICIENT_PERMISSIONS: "INSUFFICIENT_PERMISSIONS",
+  INSUFFICIENT_SCOPE: "INSUFFICIENT_SCOPE",
   ROLE_REQUIRED: "ROLE_REQUIRED",
+  // Step-up authentication ("sudo mode", issue #1389): the session is
+  // authenticated but its last cryptographic verification is too old for a
+  // critical administrative mutation.
+  SUDO_REQUIRED: "SUDO_REQUIRED",
   NOT_OWNER: "NOT_OWNER",
   NOT_SIGNER: "NOT_SIGNER",
   NOT_MEMBER: "NOT_MEMBER",
@@ -398,7 +403,9 @@ export const ERROR_STATUS: Record<string, number> = {
   // 403
   FORBIDDEN: 403,
   INSUFFICIENT_PERMISSIONS: 403,
+  INSUFFICIENT_SCOPE: 403,
   ROLE_REQUIRED: 403,
+  SUDO_REQUIRED: 403,
   NOT_OWNER: 403,
   NOT_SIGNER: 403,
   NOT_MEMBER: 403,
