@@ -13,10 +13,22 @@ import { EmptyState } from "@/components/EmptyState";
 import { LoadingSkeleton } from "@/components/LoadingSkeleton";
 import { Card } from "@/components/ui/Card";
 import { ProgressBar } from "@/components/ui/ProgressBar";
-import { useApiQuery } from "@/hooks/useApiQuery";
+import { CurrencyToggle } from "@/components/ui/CurrencyToggle";
+import { useApiQuery, useApiMutation, type ApiError } from "@/hooks/useApiQuery";
+import { useToast } from "@/components/ui/Toast";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useQueryClient } from "@tanstack/react-query";
 import { connectLiveEvents } from "@/lib/events/event-client";
+import { useCurrencyDisplay } from "@/hooks/useCurrencyDisplay";
+import { useXlmPrice } from "@/hooks/usePrice";
 import type { Batch, BatchStatus } from "@/types";
+
+interface BulkCancelResult {
+  batchId: string;
+  cancelled: number;
+  skipped: number;
+  total: number;
+}
 
 interface BatchListMeta {
   nextCursor?: string | null;
@@ -52,10 +64,23 @@ export default function BatchesPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
 
+  // ── Currency display preference (issue #795) ───────────────────
+  const { currency, setCurrency } = useCurrencyDisplay();
+  const {
+    price: xlmPrice,
+    isUnavailable: priceUnavailable,
+    isStale: priceIsStale,
+  } = useXlmPrice();
+
   // Keyset pagination: `cursor` is the boundary of the current page;
   // `cursorStack` remembers prior page boundaries so Previous works.
+  const toast = useToast();
   const [cursor, setCursor] = useState<string | null>(null);
   const [cursorStack, setCursorStack] = useState<string[]>([]);
+  // Batch awaiting the bulk-cancel confirmation dialog.
+  const [confirmBatch, setConfirmBatch] = useState<Batch | null>(null);
+  // Keeps the offending row's button in a loading state while cancelling.
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
 
   // ── Summary (status counts + per-batch drill-down) ─────────────
   const {
@@ -103,10 +128,35 @@ export default function BatchesPage() {
     }
   );
 
+  const cancelMutation = useApiMutation<{ id: string }, BulkCancelResult>(
+    (body) => `/api/batches/${body.id}`,
+    { method: "POST", invalidateKeys: [["batches"]] }
+  );
+
+  const handleBulkCancel = async (batch: Batch) => {
+    setCancellingId(batch.id);
+    try {
+      const result = await cancelMutation.mutateAsync({ id: batch.id });
+      toast.success(
+        "Bulk cancel complete",
+        `Cancelled ${result.cancelled} pending; ${result.skipped} already-submitted payment${result.skipped === 1 ? "" : "s"} skipped (${result.total} total).`
+      );
+    } catch (err) {
+      const apiErr = err as ApiError;
+      toast.error(
+        apiErr.message || "Failed to cancel pending payments"
+      );
+    } finally {
+      setCancellingId(null);
+    }
+  };
+
   const batches = Array.isArray(data?.batches) ? data.batches : [];
   const meta = data?.meta;
   const error = hasError ? "Failed to load batches" : null;
   const handleRetry = () => { load(); };
+  const pendingCount = (batch: Batch) =>
+    (batch.payments ?? []).filter((p) => p.status === "PENDING").length;
 
   const goNext = () => {
     if (!meta?.nextCursor) return;
@@ -147,15 +197,27 @@ export default function BatchesPage() {
             Process multiple payments in a single transaction
           </p>
         </div>
-        <Link
-          href="/batches/new"
-          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-ophir-600 text-white text-sm font-medium hover:bg-ophir-700 transition-colors shadow-lg shadow-ophir-500/25 active:scale-95"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4">
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-          </svg>
-          New Batch
-        </Link>
+        <div className="flex items-center gap-3">
+          {/* Issue #795 — honour the persisted currency preference */}
+          <CurrencyToggle
+            value={currency}
+            onChange={setCurrency}
+            size="sm"
+            showPrice
+            price={xlmPrice}
+            isUnavailable={priceUnavailable}
+            isStale={priceIsStale}
+          />
+          <Link
+            href="/batches/new"
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-ophir-600 text-white text-sm font-medium hover:bg-ophir-700 transition-colors shadow-lg shadow-ophir-500/25 active:scale-95"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+            </svg>
+            New Batch
+          </Link>
+        </div>
       </div>
 
       {/* ── Summary view ────────────────────────────────────────── */}
@@ -230,6 +292,7 @@ export default function BatchesPage() {
                   <th className="py-3 px-4 font-medium">Progress</th>
                   <th className="py-3 px-4 font-medium">Status</th>
                   <th className="py-3 px-4 font-medium">Created</th>
+                  <th className="py-3 px-4 font-medium">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -253,7 +316,12 @@ export default function BatchesPage() {
                       className="border-b border-gray-100 dark:border-gray-800/50 hover:bg-gray-50 dark:hover:bg-gray-800/30 transition-colors"
                     >
                       <td className="py-3 px-4">
-                        <p className="font-medium text-gray-900 dark:text-white">{batch.name}</p>
+                        <Link
+                          href={`/batches/${batch.id}`}
+                          className="font-medium text-gray-900 dark:text-white hover:text-ophir-600 dark:hover:text-ophir-400 transition-colors"
+                        >
+                          {batch.name}
+                        </Link>
                         {batch.description && (
                           <p className="text-xs text-gray-400 mt-0.5">{batch.description}</p>
                         )}
@@ -283,6 +351,30 @@ export default function BatchesPage() {
                       </td>
                       <td className="py-3 px-4 text-gray-500 dark:text-gray-400 text-xs">
                         {timeAgo(batch.createdAt)}
+                      </td>
+                      <td className="py-3 px-4">
+                        {pending > 0 ? (
+                          <button
+                            onClick={() => setConfirmBatch(batch)}
+                            disabled={cancellingId !== null}
+                            title={`Cancel ${pending} pending payment${pending === 1 ? "" : "s"}`}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors disabled:opacity-50"
+                          >
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              fill="none"
+                              viewBox="0 0 24 24"
+                              strokeWidth={1.5}
+                              stroke="currentColor"
+                              className="w-3.5 h-3.5"
+                            >
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                            Cancel {pending}
+                          </button>
+                        ) : (
+                          <span className="text-xs text-gray-300 dark:text-gray-600">—</span>
+                        )}
                       </td>
                     </tr>
                   );
@@ -319,6 +411,25 @@ export default function BatchesPage() {
           )}
         </div>
       )}
+
+      {/* Bulk-cancel confirmation dialog (Issue #158) */}
+      <ConfirmDialog
+        open={confirmBatch !== null}
+        onClose={() => setConfirmBatch(null)}
+        onConfirm={() => {
+          if (confirmBatch) handleBulkCancel(confirmBatch);
+        }}
+        title="Cancel pending payments?"
+        description={
+          confirmBatch
+            ? `This will cancel ${pendingCount(confirmBatch)} pending payment${
+                pendingCount(confirmBatch) === 1 ? "" : "s"
+              } in "${confirmBatch.name}". Already-submitted payments are skipped and reported.`
+            : ""
+        }
+        confirmLabel="Cancel pending"
+        variant="danger"
+      />
     </div>
   );
 }
